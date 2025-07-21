@@ -7,7 +7,7 @@ from typing import Optional
 import httpx
 import os
 from dotenv import load_dotenv
-import os
+import asyncio
 
 load_dotenv()
 
@@ -24,6 +24,8 @@ app.add_middleware(
 MONGO_URI = "mongodb://localhost:27017"
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
 LASTFM_BASE_URL = "http://ws.audioscrobbler.com/2.0/"
+MUSICBRAINZ_BASE_URL = "https://musicbrainz.org/ws/2/"
+COVERART_BASE_URL = "https://coverartarchive.org"
 
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["songFinder"]
@@ -44,11 +46,52 @@ class SearchQuery(BaseModel):
 async def root():
     return {"message": "Hello World"}
 
+async def get_musicbrainz_image(artist: str, track: str) -> Optional[str]:
+    """Get cover art from MusicBrainz/Cover Art Archive as fallback"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Set user agent as required by MusicBrainz
+            headers = {
+                "User-Agent": "SongFinder/1.0 (your-email@example.com)"
+            }
+            
+            # Search for the recording in MusicBrainz
+            query = f'recording:"{track}" AND artist:"{artist}"'
+            params = {
+                "query": query,
+                "fmt": "json",
+                "limit": 1
+            }
+            
+            url = f"{MUSICBRAINZ_BASE_URL}recording"
+            response = await client.get(url, params=params, headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "recordings" in data and data["recordings"]:
+                    recording = data["recordings"][0]
+                    
+                    # Get release group ID for cover art
+                    if "releases" in recording and recording["releases"]:
+                        first_release = recording["releases"][0]
+                        if "release-group" in first_release:
+                            release_group_id = first_release["release-group"]["id"]
+                            
+                            # Try to get cover art from Cover Art Archive
+                            cover_url = f"{COVERART_BASE_URL}/release-group/{release_group_id}/front"
+                            cover_response = await client.head(cover_url, follow_redirects=True)
+                            if cover_response.status_code == 200:
+                                return str(cover_response.url)
+    except Exception as e:
+        print(f"MusicBrainz lookup failed: {e}")
+    
+    return None
+
 @app.post("/api/search")
 async def search_songs(search: SearchQuery):
-    """Search for songs using Last.fm API"""
+    """Search for songs using Last.fm API with MusicBrainz fallback for images"""
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient() as lastfm_client:
             params = {
                 "method": "track.search",
                 "track": search.query,
@@ -56,7 +99,7 @@ async def search_songs(search: SearchQuery):
                 "format": "json",
                 "limit": 20 # Limit results to 20 songs
             }
-            response = await client.get(LASTFM_BASE_URL, params=params)
+            response = await lastfm_client.get(LASTFM_BASE_URL, params=params)
             if response.status_code != 200:
                 raise HTTPException(status_code=500, detail="Last.fm API error")
             
@@ -72,21 +115,19 @@ async def search_songs(search: SearchQuery):
                     track_list = [track_list]
                 
                 for track in track_list:
-                    # Extract image information
-                    image_url = None
-                    if "image" in track and isinstance(track["image"], list):
-                        # Last.fm provides images in different sizes: small, medium, large, extralarge
-                        # Let's get the largest available image
-                        for img in reversed(track["image"]):  # Start from the end (usually largest)
-                            if img.get("#text"):  # Check if image URL exists
-                                image_url = img["#text"]
-                                break
+                    artist_name = track.get('artist', 'Unknown Artist')
+                    track_title = track.get('name', 'Unknown Track')
+                    
+                    # Always get image from MusicBrainz
+                    image_url = await get_musicbrainz_image(artist_name, track_title)
+                    # Add small delay to respect rate limits
+                    await asyncio.sleep(0.1)
                     
                     # Format track data
                     track_data = {
-                        "name": f"{track.get('artist', 'Unknown Artist')} - {track.get('name', 'Unknown Track')}",
-                        "artist": track.get('artist', 'Unknown Artist'),
-                        "title": track.get('name', 'Unknown Track'),
+                        "name": f"{artist_name} - {track_title}",
+                        "artist": artist_name,
+                        "title": track_title,
                         "image": image_url,
                         "listeners": track.get('listeners'),
                         "url": track.get('url')
