@@ -38,6 +38,8 @@ class Song(BaseModel):
     artist: Optional[str] = None
     title: Optional[str] = None
     image: Optional[str] = None
+    listeners: Optional[str] = None
+    url: Optional[str] = None
 
 class SearchQuery(BaseModel):
     query: str
@@ -97,7 +99,7 @@ async def search_songs(search: SearchQuery):
                 "track": search.query,
                 "api_key": LASTFM_API_KEY,
                 "format": "json",
-                "limit": 20 # Limit results to 20 songs
+                "limit": 8
             }
             response = await lastfm_client.get(LASTFM_BASE_URL, params=params)
             if response.status_code != 200:
@@ -147,6 +149,7 @@ async def add_song(song: Song):
     if existing_song:
         raise HTTPException(status_code=400, detail="Song already exists for this user")
     
+    # Store the song with all metadata
     song_dict = song.dict()
     result = await collection.insert_one(song_dict)
     return {
@@ -157,8 +160,10 @@ async def add_song(song: Song):
 @app.get("/api/songs/{username}")
 async def get_user_songs(username: str):
     songs = []
-    async for song in collection.find({"username": username}):
-        songs.append(song["song"])
+    async for song_doc in collection.find({"username": username}):
+        # Remove the MongoDB _id field and return the complete song object
+        song_doc.pop('_id', None)  # Remove MongoDB's _id field
+        songs.append(song_doc)
     return {"songs": songs}
 
 @app.delete("/api/songs/{username}/{song_name}")
